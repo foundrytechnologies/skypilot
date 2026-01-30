@@ -4,6 +4,15 @@ on:
   push:
     tags:
       - "skypilot-mithril/*.*.*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag, or SHA to build'
+        required: true
+        default: 'main'
+      version:
+        description: 'Version to publish (e.g. 0.1.0a1)'
+        required: true
 
 jobs:
   publish:
@@ -13,17 +22,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.ref || github.ref }}
           # Required for commit hash embedding in package
           fetch-depth: 0
 
-      - name: Extract version from tag
+      - name: Extract version
         id: extract_version
         run: |
-          # Tag format: skypilot-mithril/1.2.3
-          TAG="${GITHUB_REF#refs/tags/}"
-          VERSION="${TAG#skypilot-mithril/}"
+          if [ -n "${{ inputs.version }}" ]; then
+            # Manual trigger: use provided version
+            VERSION="${{ inputs.version }}"
+          else
+            # Tag trigger: extract from tag
+            TAG="${GITHUB_REF#refs/tags/}"
+            VERSION="${TAG#skypilot-mithril/}"
+          fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Extracted version: $VERSION"
+          echo "Version: $VERSION"
 
       - name: Set up Node.js (for dashboard build)
         uses: actions/setup-node@v4
