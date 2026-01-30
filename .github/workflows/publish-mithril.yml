@@ -7,11 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 'Branch, tag, or SHA to build'
-        required: true
-        default: 'main'
-      version:
-        description: 'Version to publish (e.g. 0.1.0a1)'
+        description: 'Tag name: skypilot-mithril/X.Y.Z (e.g. skypilot-mithril/0.1.0a1)'
         required: true
 
 jobs:
@@ -26,17 +22,25 @@ jobs:
           # Required for commit hash embedding in package
           fetch-depth: 0
 
-      - name: Extract version
+      - name: Extract version from tag
         id: extract_version
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            # Manual trigger: use provided version
-            VERSION="${{ inputs.version }}"
+          if [ -n "${{ inputs.ref }}" ]; then
+            # Manual trigger: extract from input tag
+            TAG="${{ inputs.ref }}"
           else
-            # Tag trigger: extract from tag
+            # Tag trigger: extract from GITHUB_REF
             TAG="${GITHUB_REF#refs/tags/}"
-            VERSION="${TAG#skypilot-mithril/}"
           fi
+
+          # Validate tag format
+          if [[ ! "$TAG" =~ ^skypilot-mithril/[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "Error: Invalid tag format '$TAG'"
+            echo "Expected format: skypilot-mithril/X.Y.Z (e.g. skypilot-mithril/0.1.0a1)"
+            exit 1
+          fi
+
+          VERSION="${TAG#skypilot-mithril/}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Version: $VERSION"
 
@@ -65,6 +69,13 @@ jobs:
 
           # Verify the change
           grep "name='skypilot-mithril'" setup.py
+
+      - name: Patch version
+        run: |
+          VERSION="${{ steps.extract_version.outputs.version }}"
+          echo "Setting version to: $VERSION"
+          sed -i "s/__version__ = '.*'/__version__ = '$VERSION'/" sky/__init__.py
+          grep "__version__" sky/__init__.py
 
       - name: Build package
         run: uv build
