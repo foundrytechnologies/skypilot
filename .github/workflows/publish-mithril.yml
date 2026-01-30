@@ -1,0 +1,60 @@
+name: Publish skypilot-mithril to PyPI
+
+on:
+  push:
+    tags:
+      - "skypilot-mithril/*.*.*"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Required for commit hash embedding in package
+          fetch-depth: 0
+
+      - name: Extract version from tag
+        id: extract_version
+        run: |
+          # Tag format: skypilot-mithril/1.2.3
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG#skypilot-mithril/}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Extracted version: $VERSION"
+
+      - name: Set up Node.js (for dashboard build)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '23'
+          cache: 'npm'
+          cache-dependency-path: 'sky/dashboard/package-lock.json'
+
+      - name: Build dashboard
+        run: |
+          cd sky/dashboard
+          npm ci
+          npm run build
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          python-version: '3.11'
+
+      - name: Patch package name to skypilot-mithril
+        run: |
+          # Change package name in setup.py
+          sed -i "s/name='skypilot'/name='skypilot-mithril'/" setup.py
+
+          # Verify the change
+          grep "name='skypilot-mithril'" setup.py
+
+      - name: Build package
+        run: uv build
+
+      - name: Publish to PyPI
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: uv publish --token "$UV_PUBLISH_TOKEN" dist/*
