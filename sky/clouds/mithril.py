@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from sky import catalog
 from sky import clouds
+from sky import skypilot_config
 from sky.utils import registry
 from sky.utils import resources_utils
 from sky.utils.resources_utils import DiskTier
@@ -293,10 +294,17 @@ class Mithril(clouds.Cloud):
         custom_resources = resources_utils.make_ray_custom_resources_str(
             acc_dict)
 
+        limit_price = skypilot_config.get_nested(
+            ('mithril', 'limit_price'),
+            default_value=None,
+            override_configs=resources.cluster_config_overrides,
+        )
+
         resources_vars: Dict[str, Any] = {
             'instance_type': resources.instance_type,
             'custom_resources': custom_resources,
             'region': region.name,
+            'limit_price': limit_price,
         }
 
         docker_run_options = []
