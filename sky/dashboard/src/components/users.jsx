@@ -1651,6 +1651,7 @@ function UsersTable({
         if (setLastFetchedTime) setLastFetchedTime(new Date());
       }
     },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [setLoading, setLastFetchedTime]
   );
 
@@ -2941,7 +2942,7 @@ function ServiceAccountTokensView({
                     placeholder="e.g., 30"
                     min="0"
                     max="365"
-                    value={newToken.expires_in_days || ''}
+                    value={newToken.expires_in_days ?? ''}
                     onChange={(e) =>
                       setNewToken({
                         ...newToken,

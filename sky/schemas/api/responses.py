@@ -84,6 +84,8 @@ class APIHealthResponse(ResponseBaseModel):
     service_account_token_enabled: bool = False
     # Whether basic auth on ingress is enabled
     ingress_basic_auth_enabled: bool = False
+    # Latest version info (if available)
+    latest_version: Optional[str] = None
 
 
 class StatusResponse(ResponseBaseModel):
@@ -202,10 +204,19 @@ class ManagedJobRecord(ResponseBaseModel):
     pool: Optional[str] = None
     pool_hash: Optional[str] = None
     current_cluster_name: Optional[str] = None
+    cluster_name_on_cloud: Optional[str] = None
     job_id_on_pool_cluster: Optional[int] = None
     accelerators: Optional[Dict[str, int]] = None
     labels: Optional[Dict[str, str]] = None
     links: Optional[Dict[str, str]] = None
+    # JobGroup fields
+    # Execution mode: 'parallel' (job group) or 'serial' (pipeline/single job)
+    execution: Optional[str] = None
+    is_job_group: Optional[bool] = None
+    # Whether this task is a primary task (True) or auxiliary task (False)
+    # within a job group. NULL for non-job-group jobs (single jobs and
+    # pipelines).
+    is_primary_in_job_group: Optional[bool] = None
 
 
 class VolumeRecord(ResponseBaseModel):
@@ -229,3 +240,6 @@ class VolumeRecord(ResponseBaseModel):
     usedby_clusters: List[str]
     is_ephemeral: bool = False
     usedby_fetch_failed: bool = False
+    # Error message for volume in ERROR state (e.g., PVC pending due to
+    # access mode mismatch)
+    error_message: Optional[str] = None

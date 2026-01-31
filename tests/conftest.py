@@ -77,7 +77,7 @@ all_clouds_in_smoke_tests = [
     'aws', 'gcp', 'azure', 'lambda', 'cloudflare', 'ibm', 'scp', 'oci', 'do',
     'kubernetes', 'vsphere', 'cudo', 'fluidstack', 'paperspace',
     'primeintellect', 'runpod', 'vast', 'nebius', 'hyperbolic', 'seeweb',
-    'shadeform', 'coreweave', 'slurm'
+    'shadeform', 'coreweave', 'slurm', 'mithril'
 ]
 default_clouds_to_run = ['aws', 'azure']
 
@@ -109,6 +109,7 @@ cloud_to_pytest_keyword = {
     'seeweb': 'seeweb',
     'coreweave': 'coreweave',
     'slurm': 'slurm',
+    'mithril': 'mithril',
 }
 
 
@@ -234,6 +235,13 @@ def pytest_addoption(parser):
               'has no effect when running locally)'),
     )
     parser.addoption(
+        '--submodule-base-branch',
+        type=str,
+        default=None,
+        help=('Base branch for submodule tests (configured in Buildkite '
+              'pipeline; has no effect when running locally)'),
+    )
+    parser.addoption(
         '--backend-test-cluster',
         type=str,
         default=None,
@@ -260,6 +268,9 @@ def pytest_configure(config):
     config.addinivalue_line('markers', 'slow: mark test as slow to run')
     config.addinivalue_line('markers',
                             'local: mark test to run only on local API server')
+    config.addinivalue_line(
+        'markers', 'no_auto_retry: mark test to disable automatic retries '
+        'in Buildkite CI (manual retries still allowed)')
     for cloud in all_clouds_in_smoke_tests:
         cloud_keyword = cloud_to_pytest_keyword[cloud]
         config.addinivalue_line(

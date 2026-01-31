@@ -70,6 +70,13 @@ _AUTOSTOP_SCHEMA = {
                     'type': 'string',
                     'case_insensitive_enum':
                         autostop_lib.AutostopWaitFor.supported_modes(),
+                },
+                'hook': {
+                    'type': 'string',
+                },
+                'hook_timeout': {
+                    'type': 'integer',
+                    'minimum': 1,
                 }
             },
         },
@@ -337,7 +344,10 @@ def _get_single_resources_schema():
                     },
                     'tpu_vm': {
                         'type': 'boolean',
-                    }
+                    },
+                    'gcp_queued_resource': {
+                        'type': 'boolean',
+                    },
                 }
             },
             '_no_missing_accel_warnings': {
@@ -674,7 +684,35 @@ def get_service_schema():
                 }]
             },
             'pool': {
-                'type': 'boolean',
+                'type': 'object',
+                'required': [],
+                'additionalProperties': False,
+                'properties': {
+                    'workers': {
+                        'type': 'integer',
+                        'minimum': 0,
+                    },
+                    'min_workers': {
+                        'type': 'integer',
+                        'minimum': 0,
+                    },
+                    'queue_length_threshold': {
+                        'type': 'integer',
+                        'minimum': 1,
+                    },
+                    'max_workers': {
+                        'type': 'integer',
+                        'minimum': 0,
+                    },
+                    'upscale_delay_seconds': {
+                        'type': 'number',
+                        'minimum': 0,
+                    },
+                    'downscale_delay_seconds': {
+                        'type': 'number',
+                        'minimum': 0,
+                    },
+                },
             },
             'replica_policy': {
                 'type': 'object',
@@ -1182,7 +1220,19 @@ _CONTEXT_CONFIG_SCHEMA_KUBERNETES = {
         'items': {
             'type': 'string'
         },
-    }
+    },
+    'set_pod_resource_limits': {
+        # Can be:
+        # - false: do not set limits (default)
+        # - true: set limits equal to requests (multiplier of 1)
+        # - number: set limits to requests * multiplier
+        'oneOf': [{
+            'type': 'boolean',
+        }, {
+            'type': 'number',
+            'minimum': 1,
+        }],
+    },
 }
 
 
@@ -1267,6 +1317,18 @@ def get_config_schema():
                         'type': 'string',
                     }, {
                         'type': 'null',
+                    }]
+                },
+                'vpc_names': {
+                    'oneOf': [{
+                        'type': 'string',
+                    }, {
+                        'type': 'null',
+                    }, {
+                        'type': 'array',
+                        'items': {
+                            'type': 'string'
+                        }
                     }],
                 },
                 'use_ssm': {
@@ -1487,6 +1549,9 @@ def get_config_schema():
                 'datacenter_only': {
                     'type': 'boolean',
                 },
+                'create_instance_kwargs': {
+                    'type': 'object',
+                },
             }
         },
         'nebius': {
@@ -1650,6 +1715,9 @@ def get_config_schema():
             'cluster_debug_event_retention_hours': {
                 'type': 'number',
             },
+            'cluster_terminal_event_retention_hours': {
+                'type': 'number',
+            },
         }
     }
 
@@ -1767,6 +1835,39 @@ def get_config_schema():
                         'disabled': {
                             'type': 'boolean'
                         },
+                        'kueue': {
+                            'type': 'object',
+                            'required': [],
+                            'additionalProperties': False,
+                            'properties': {
+                                'local_queue_name': {
+                                    'type': 'string',
+                                },
+                            },
+                        },
+                        'context_configs': {
+                            'type': 'object',
+                            'required': [],
+                            'properties': {},
+                            # Properties are kubernetes context names.
+                            'additionalProperties': {
+                                'type': 'object',
+                                'required': [],
+                                'additionalProperties': False,
+                                'properties': {
+                                    'kueue': {
+                                        'type': 'object',
+                                        'required': [],
+                                        'additionalProperties': False,
+                                        'properties': {
+                                            'local_queue_name': {
+                                                'type': 'string',
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                        },
                     },
                     'additionalProperties': False,
                 },
@@ -1801,6 +1902,9 @@ def get_config_schema():
             'ssh_timeout': {
                 'type': 'integer',
                 'minimum': 1,
+            },
+            'install_conda': {
+                'type': 'boolean',
             },
         }
     }
