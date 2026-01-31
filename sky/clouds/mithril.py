@@ -1,6 +1,7 @@
 """Mithril Cloud provider implementation for SkyPilot."""
 
 import os
+import re
 import typing
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -163,6 +164,16 @@ class Mithril(clouds.Cloud):
     def __repr__(self):
         return self._REPR
 
+    @classmethod
+    def is_volume_name_valid(cls,
+                             volume_name: str) -> Tuple[bool, Optional[str]]:
+        if len(volume_name) > 64:
+            return False, 'Volume name must be at most 64 characters.'
+        if not re.fullmatch(r'^[a-z]([-a-z0-9]*[a-z0-9])?$', volume_name):
+            return False, ('Volume name must match '
+                           '^[a-z]([-a-z0-9]*[a-z0-9])?$.')
+        return True, None
+
     def _get_feasible_launchable_resources(
         self, resources: 'resources_lib.Resources'
     ) -> 'resources_utils.FeasibleResources':
@@ -288,6 +299,7 @@ class Mithril(clouds.Cloud):
             'region': region.name,
         }
 
+        docker_run_options = []
         if acc_dict is not None:
             # Mithril's VM images may not register nvidia-container-runtime with
             # Docker in the standard way (e.g., via /etc/docker/daemon.json).
@@ -295,6 +307,14 @@ class Mithril(clouds.Cloud):
             # 'nvidia-container-runtime', which may not be present even though
             # `--gpus all` works. We explicitly add it here to ensure Docker
             # containers can access GPUs.
-            resources_vars['docker_run_options'] = ['--gpus all']
+            docker_run_options.append('--gpus all')
+
+        # Add volume mounts to Docker so containers can access block volumes.
+        if volume_mounts:
+            for vm in volume_mounts:
+                docker_run_options.append(f'--volume={vm.path}:{vm.path}')
+
+        if docker_run_options:
+            resources_vars['docker_run_options'] = docker_run_options
 
         return resources_vars
