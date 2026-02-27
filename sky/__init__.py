@@ -153,8 +153,10 @@ Vsphere = clouds.Vsphere
 Fluidstack = clouds.Fluidstack
 Nebius = clouds.Nebius
 Hyperbolic = clouds.Hyperbolic
+Mithril = clouds.Mithril
 Shadeform = clouds.Shadeform
 Seeweb = clouds.Seeweb
+Yotta = clouds.Yotta
 
 __all__ = [
     '__version__',
@@ -178,8 +180,10 @@ __all__ = [
     'Fluidstack',
     'Nebius',
     'Hyperbolic',
+    'Mithril',
     'Shadeform',
     'Seeweb',
+    'Yotta',
     'Optimizer',
     'OptimizeTarget',
     'backends',
