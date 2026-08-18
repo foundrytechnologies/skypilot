@@ -1566,6 +1566,15 @@ def get_config_schema():
                 'restart_job_after_interruption': {
                     'type': 'boolean',
                 },
+                'prioritize_reservations': {
+                    'type': 'boolean',
+                },
+                'specific_reservations': {
+                    'type': 'array',
+                    'items': {
+                        'type': 'string',
+                    },
+                },
             }
         },
         'nebius': {

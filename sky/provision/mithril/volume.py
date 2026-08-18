@@ -59,25 +59,6 @@ def _list_bids() -> List[Dict[str, Any]]:
     return bids
 
 
-def _list_reservations() -> List[Dict[str, Any]]:
-    config = utils.resolve_current_config()
-    base_params: Dict[str, Any] = ({
-        'project': quote(config['project_id'])
-    } if config['project_id'] else {})
-    reservations: List[Dict[str, Any]] = []
-    cursor: Optional[str] = None
-    while True:
-        params = base_params.copy()
-        if cursor:
-            params['next_cursor'] = cursor
-        response = utils.make_request('GET', '/v2/reservation', params=params)
-        reservations.extend(response.get('data', []))
-        cursor = response.get('next_cursor')
-        if not cursor:
-            break
-    return reservations
-
-
 def _try_resolve_volume_by_name(
         name_on_cloud: str, region: Optional[str]) -> Optional[Dict[str, Any]]:
     vols = _list_volumes(region=region)
@@ -176,7 +157,7 @@ def get_volume_usedby(
             if name not in usedby_names:
                 usedby_names.append(name)
     if reservation_ids:
-        reservations = _list_reservations()
+        reservations = utils.list_reservations()
         reservation_name_by_id = {
             reservation['fid']: reservation['name']
             for reservation in reservations

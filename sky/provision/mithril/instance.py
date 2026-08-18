@@ -1,5 +1,6 @@
 """Mithril instance provisioning."""
 
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from sky import sky_logging
@@ -40,29 +41,135 @@ def _resolve_config(
     return utils.resolve_current_config()
 
 
+def _reservation_fid(
+        provider_config: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """FID of the reservation backing this cluster, if it is reservation-backed.
+
+    Written into the cluster YAML at launch time (see Mithril
+    .make_deploy_resources_variables), because a reserved instance is named
+    after its reservation and so cannot carry the cluster's name.
+    """
+    if provider_config is None:
+        return None
+    return provider_config.get('reservation') or None
+
+
+def _resume_reservation_if_paused(
+    reservation_fid: str,
+    resume_stopped_nodes: bool,
+    config: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """Resume a paused reservation so its instances come back.
+
+    Returns the instance IDs that were resumed, for the ProvisionRecord. A
+    reservation whose window has closed is refused rather than touched: the API
+    accepts a pause on an expired reservation and then will not resume it, so
+    the damage would be irreversible.
+    """
+    reservation = utils.get_reservation(reservation_fid, config=config)
+    if reservation is None:
+        raise utils.MithrilError(
+            f'Reservation {reservation_fid} not found. It may have been '
+            'returned or belong to another project.')
+
+    if utils.reservation_is_finished(reservation):
+        raise utils.MithrilError(
+            f'Reservation {reservation["name"]} has ended '
+            f'(status {reservation.get("status")}, window closed '
+            f'{reservation.get("end_time")}). Reserved capacity cannot be '
+            'revived; create a new reservation.')
+
+    if reservation.get('status') != 'Paused':
+        return []
+    if not resume_stopped_nodes:
+        raise utils.MithrilError(
+            f'Reservation {reservation["name"]} is paused. Run '
+            '`ml start <cluster>` to resume it, or '
+            f'`ml reservation resume {reservation["name"]}`.')
+
+    logger.debug(f'Resuming paused reservation {reservation_fid}')
+    utils.update_reservation(reservation_fid, paused=False, config=config)
+    return list(reservation.get('instances') or [])
+
+
+# SkyPilot re-queries instance statuses immediately after a stop or teardown and
+# treats anything other than stopped/terminated as an error, retrying for only
+# about ten seconds (_TEARDOWN_WAIT_MAX_ATTEMPTS). A Mithril pause passes through
+# STATUS_STOPPING, which maps to ClusterStatus.UP, so returning before the pause
+# settles makes `ml stop` / `ml down` fail with "Instances in unexpected state".
+_PAUSE_SETTLED_STATUSES: List[MithrilStatus] = [
+    'STATUS_PAUSED',
+    'STATUS_STOPPED',
+    'STATUS_TERMINATED',
+]
+_PAUSE_WAIT_TIMEOUT_SECONDS = 300
+_PAUSE_WAIT_POLL_SECONDS = 5
+
+
+def _wait_for_reservation_paused(
+    reservation_fid: str,
+    config: Optional[Dict[str, str]] = None,
+) -> None:
+    """Wait until a reservation's instances have finished pausing.
+
+    Gives up quietly on timeout rather than raising: the pause has been
+    requested and will complete, and failing the teardown would be worse than
+    letting SkyPilot's own check report the state it finds.
+    """
+    deadline = time.time() + _PAUSE_WAIT_TIMEOUT_SECONDS
+    while True:
+        instances = _filter_instances(
+            '',
+            status_not_in=_PAUSE_SETTLED_STATUSES,
+            config=config,
+            reservation_fid=reservation_fid,
+        )
+        if not instances:
+            logger.debug(f'Reservation {reservation_fid}: pause settled.')
+            return
+        if time.time() >= deadline:
+            logger.warning(
+                f'Reservation {reservation_fid}: {len(instances)} instance(s) '
+                'still pausing after '
+                f'{_PAUSE_WAIT_TIMEOUT_SECONDS}s; continuing anyway.')
+            return
+        logger.debug(f'Reservation {reservation_fid}: waiting for '
+                     f'{len(instances)} instance(s) to finish pausing.')
+        time.sleep(_PAUSE_WAIT_POLL_SECONDS)
+
+
 def _filter_instances(
     cluster_name_on_cloud: str,
     status_in: Optional[List[MithrilStatus]] = None,
     status_not_in: Optional[List[MithrilStatus]] = None,
     config: Optional[Dict[str, str]] = None,
+    reservation_fid: Optional[str] = None,
 ) -> Dict[str, Dict[str, Any]]:
-    """Filter instances by cluster name and status.
+    """Filter instances belonging to a cluster, by status.
 
     Args:
-        cluster_name_on_cloud: Cluster name prefix to match.
+        cluster_name_on_cloud: Cluster name prefix to match. Ignored when
+            reservation_fid is given.
         status_in: If provided, only include instances with these statuses.
         status_not_in: If provided, exclude instances with these statuses.
         config: Optional pre-resolved Mithril config for API calls.
+        reservation_fid: If given, select the reservation's instances instead of
+            matching on name. Bid-created instances are named after the bid, so
+            the cluster name is a valid prefix; reserved instances are named
+            after their reservation, so only the FID identifies them.
     """
     logger.debug(f'Filtering instances: cluster={cluster_name_on_cloud}, '
-                 f'status_in={status_in}, status_not_in={status_not_in}')
+                 f'reservation={reservation_fid}, status_in={status_in}, '
+                 f'status_not_in={status_not_in}')
 
     instances = utils.list_instances(config=config)
     filtered_instances: Dict[str, Dict[str, Any]] = {}
 
     for instance_id, instance in instances.items():
-        instance_name = instance['name']
-        if not instance_name.startswith(cluster_name_on_cloud):
+        if reservation_fid is not None:
+            if instance.get('reservation') != reservation_fid:
+                continue
+        elif not instance['name'].startswith(cluster_name_on_cloud):
             continue
 
         status = instance['status']
@@ -95,9 +202,16 @@ def run_instances(
                  f'cluster={cluster_name_on_cloud}')
     logger.debug(f'Config: {config}')
 
-    # Check if there's a paused bid that needs to be resumed
+    # A reservation-backed cluster runs on instances the reservation already
+    # created, so there is nothing to bid for: it is adopted, not provisioned.
+    reservation_fid = _reservation_fid(config.provider_config)
     resumed_instance_ids: List[str] = []
-    if config.resume_stopped_nodes:
+
+    if reservation_fid is not None:
+        resumed_instance_ids = _resume_reservation_if_paused(
+            reservation_fid, resume_stopped_nodes=config.resume_stopped_nodes)
+    elif config.resume_stopped_nodes:
+        # Check if there's a paused bid that needs to be resumed
         bid = utils.get_bid(cluster_name_on_cloud)
         if bid:
             bid_status = bid.get('status')
@@ -120,6 +234,7 @@ def run_instances(
         status_not_in=[
             'STATUS_TERMINATED',
         ],
+        reservation_fid=reservation_fid,
     )
 
     # Separate instances with and without SSH destinations
@@ -170,6 +285,20 @@ def run_instances(
             f'Cluster {cluster_name_on_cloud} has {existing_count} instances '
             f'but {desired_count} requested. Adding instances to existing '
             f'cluster is not supported.')
+
+    if reservation_fid is not None:
+        # Falling through to the bid path here would buy spot capacity on top of
+        # a reservation the user is already paying for. A reservation's size is
+        # fixed at creation, so the only honest answer is to stop.
+        reservation_name = (config.provider_config or
+                            {}).get('reservation_name') or reservation_fid
+        raise utils.MithrilError(
+            f'Reservation {reservation_name} has no usable instances for '
+            f'cluster {cluster_name_on_cloud} ({desired_count} requested, '
+            f'{existing_count} found). A reservation cannot grow, and its '
+            'instances must be authorized with this machine\'s SkyPilot SSH '
+            'key when the reservation is created. Check '
+            f'`ml reservation info {reservation_name}`.')
 
     # No instances exist - launch new ones
     to_start_count = desired_count
@@ -230,15 +359,48 @@ def terminate_instances(
     provider_config: Optional[dict] = None,
     worker_only: bool = False,
 ) -> None:
-    """Terminate all instances in the cluster by canceling their bid.
+    """Tear down a cluster.
 
-    Uses the cancel bid API (DELETE spot/bids/{bid_id}) which immediately
-    terminates all instances associated with the bid.
+    Bid-backed: cancel the bid (DELETE spot/bids/{bid_id}), which immediately
+    terminates its instances.
+
+    Reservation-backed: pause the reservation instead. Reserved capacity is paid
+    for up front and cannot be cancelled, so "terminate" cannot mean "stop
+    paying". Pausing recovers pause credit for the remainder of the window while
+    leaving the reservation intact; returning instances is irreversible and stays
+    an explicit `ml reservation return`.
     """
     del worker_only  # unused
     config = _resolve_config(provider_config)
+    reservation_fid = _reservation_fid(provider_config)
     logger.debug(
         f'Terminating all instances for cluster {cluster_name_on_cloud}')
+
+    if reservation_fid is not None:
+        reservation = utils.get_reservation(reservation_fid, config=config)
+        if reservation is None:
+            logger.debug(f'Reservation {reservation_fid} no longer exists; '
+                         'nothing to release.')
+            return
+        if utils.reservation_is_finished(reservation):
+            # Already over, or already outside its window: pausing an expired
+            # reservation is accepted by the API and cannot be undone.
+            logger.debug(f'Reservation {reservation["name"]} has ended; '
+                         'leaving it untouched.')
+            return
+        if reservation.get('status') == 'Paused':
+            logger.debug(f'Reservation {reservation["name"]} is already '
+                         'paused.')
+            return
+        utils.update_reservation(reservation_fid, paused=True, config=config)
+        _wait_for_reservation_paused(reservation_fid, config=config)
+        logger.info(
+            f'Paused reservation {reservation["name"]} for cluster '
+            f'{cluster_name_on_cloud}. The reservation is still yours until '
+            f'{reservation.get("end_time")}; paused capacity earns pause '
+            f'credit. Use `ml reservation return {reservation["name"]}` to give '
+            'the instances back permanently.')
+        return
 
     # Get the bid for this cluster
     bid = utils.get_bid(cluster_name_on_cloud, config=config)
@@ -273,6 +435,7 @@ def get_cluster_info(
             'STATUS_TERMINATED',
         ],
         config=config,
+        reservation_fid=_reservation_fid(provider_config),
     )
     instances: Dict[str, List[common.InstanceInfo]] = {}
     head_instance_id = None
@@ -317,7 +480,11 @@ def query_instances(
     """Returns the status of the specified instances for Mithril."""
     del cluster_name, retry_if_missing  # unused
     config = _resolve_config(provider_config)
-    instances = _filter_instances(cluster_name_on_cloud, config=config)
+    instances = _filter_instances(
+        cluster_name_on_cloud,
+        config=config,
+        reservation_fid=_reservation_fid(provider_config),
+    )
 
     statuses: Dict[str, Tuple[Optional['status_lib.ClusterStatus'],
                               Optional[str]]] = {}
@@ -344,14 +511,35 @@ def stop_instances(
     provider_config: Optional[Dict[str, Any]] = None,
     worker_only: bool = False,
 ) -> None:
-    """Stop running instances by pausing the bid.
+    """Stop running instances by pausing.
 
-    This pauses the bid, which stops all instances associated with it.
-    The instances can be resumed later by unpausing the bid.
+    Bid-backed: pause the bid. Reservation-backed: pause the reservation, which
+    hands the capacity back for the rest of the window and earns pause credit.
+    Either way `ml start` resumes it.
     """
     del worker_only  # unused
     config = _resolve_config(provider_config)
+    reservation_fid = _reservation_fid(provider_config)
     logger.debug(f'Stopping instances for cluster {cluster_name_on_cloud}')
+
+    if reservation_fid is not None:
+        reservation = utils.get_reservation(reservation_fid, config=config)
+        if reservation is None:
+            logger.debug(f'Reservation {reservation_fid} no longer exists.')
+            return
+        if utils.reservation_is_finished(reservation):
+            # Pausing past the window is irreversible; see design 3.6.
+            logger.debug(f'Reservation {reservation["name"]} has ended; not '
+                         'pausing.')
+            return
+        if reservation.get('status') == 'Paused':
+            logger.debug(f'Reservation {reservation["name"]} already paused.')
+            return
+        utils.update_reservation(reservation_fid, paused=True, config=config)
+        _wait_for_reservation_paused(reservation_fid, config=config)
+        logger.debug(f'Paused reservation {reservation_fid} for cluster '
+                     f'{cluster_name_on_cloud}')
+        return
 
     bid = utils.get_bid(cluster_name_on_cloud, config=config)
     if not bid:
