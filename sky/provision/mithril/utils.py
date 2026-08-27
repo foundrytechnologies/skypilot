@@ -1,9 +1,11 @@
 """Mithril API utilities."""
 
+import datetime
 import json
+import math
 import os
 import time
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 from urllib.parse import quote
 
 from sky import sky_logging
@@ -491,6 +493,11 @@ def list_instances(
                     'instance_type': instance['instance_type'],
                     'created_at': instance['created_at'],
                     'bid': instance['bid'],
+                    # Which reservation owns this instance, if any. Needed to
+                    # identify a reservation-backed cluster's nodes: a reserved
+                    # instance is named after its reservation, so its name never
+                    # matches the cluster name.
+                    'reservation': instance.get('reservation'),
                     'private_ip': instance['private_ip'],
                     'region': instance['region'],
                 }
@@ -527,6 +534,297 @@ def get_instance_types() -> Dict[str, Dict[str, Any]]:
     instance_types: List[Dict[str, Any]] = make_request('GET',
                                                         '/v2/instance-types')
     return {it['fid']: it for it in instance_types}
+
+
+# Reservation statuses that can still hold usable capacity. 'Ended' and
+# 'Canceled' are terminal; 'Paused' capacity is usable because resuming is a
+# single PATCH, and pausing is how an idle reservation earns credit.
+_USABLE_RESERVATION_STATUSES = frozenset({'Active', 'Pending', 'Paused'})
+
+
+def list_reservations(
+        config: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+    """List all reservations for the project, following pagination.
+
+    Args:
+        config: Optional pre-resolved config dict. If not provided, uses
+            resolve_current_config().
+    """
+    if config is None:
+        config = resolve_current_config()
+    base_params: Dict[str, Any] = ({
+        'project': quote(config['project_id'])
+    } if config['project_id'] else {})
+    reservations: List[Dict[str, Any]] = []
+    cursor: Optional[str] = None
+    while True:
+        params = base_params.copy()
+        if cursor:
+            params['next_cursor'] = cursor
+        response = make_request('GET',
+                                '/v2/reservation',
+                                params=params,
+                                config=config)
+        reservations.extend(response.get('data', []))
+        cursor = response.get('next_cursor')
+        if not cursor:
+            break
+    return reservations
+
+
+def _reservation_end_epoch(reservation: Dict[str, Any]) -> Optional[float]:
+    """When a reservation's window closes, as a UNIX timestamp.
+
+    None when there is no end time or it cannot be parsed. Parsed rather than
+    compared as a string because ordering by expiry must not depend on the API
+    formatting timestamps identically every time.
+    """
+    end_time = reservation.get('end_time')
+    if not end_time:
+        return None
+    try:
+        # RFC3339; Python's parser wants an explicit UTC offset, not 'Z'.
+        parsed = datetime.datetime.fromisoformat(
+            str(end_time).replace('Z', '+00:00'))
+    except ValueError:
+        logger.debug(f'Could not parse reservation end_time {end_time!r}.')
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.timestamp()
+
+
+def _reservation_has_expired(reservation: Dict[str, Any],
+                             now: Optional[float] = None) -> bool:
+    """Whether a reservation's window has already closed.
+
+    A reservation can sit in a non-terminal status past its end time, and the
+    API accepts a pause on it irreversibly, so expiry is checked against the
+    clock rather than trusting the status alone. Unparseable end times are
+    treated as expired: refusing to use a reservation we cannot reason about is
+    the safe direction.
+    """
+    end = _reservation_end_epoch(reservation)
+    if end is None:
+        return True
+    if now is None:
+        now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    return end <= now
+
+
+def get_reservation(
+    reservation_fid: str,
+    config: Optional[Dict[str, str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Fetch one reservation by FID, or None if the project has no such record.
+
+    Reads from the project listing rather than a by-FID endpoint so that a
+    reservation belonging to another project reads as absent rather than as an
+    authorization error.
+    """
+    for reservation in list_reservations(config=config):
+        if reservation.get('fid') == reservation_fid:
+            return reservation
+    return None
+
+
+def reservation_is_finished(reservation: Dict[str, Any]) -> bool:
+    """Whether a reservation can no longer host workloads.
+
+    Terminal status or a closed window. Kept separate from the usability filter
+    because callers acting on an existing cluster need to distinguish "finished"
+    from "not a candidate for a new cluster".
+    """
+    if reservation.get('status') not in _USABLE_RESERVATION_STATUSES:
+        return True
+    return _reservation_has_expired(reservation)
+
+
+def update_reservation(
+    reservation_fid: str,
+    paused: bool,
+    config: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Pause or resume a reservation.
+
+    Pausing hands capacity back and earns pause credit; resuming brings the
+    instances back. Callers must check reservation_is_finished() first: the API
+    accepts a pause on an expired reservation and then refuses to resume it.
+    """
+    logger.debug(f'Updating reservation {reservation_fid}, paused: {paused}')
+    return make_request('PATCH',
+                        f'/v2/reservation/{reservation_fid}',
+                        payload={'paused': paused},
+                        config=config)
+
+
+def usable_reservations(
+    instance_type_name: str,
+    region: str,
+    specific_reservations: Optional[Set[str]] = None,
+    config: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    """Reservation records that can host a cluster right now.
+
+    A reservation is usable when it is in a non-terminal status, its window is
+    still open, and it holds the requested instance type in the requested
+    region.
+
+    Ordered by the soonest window to close, then by name for stability. That
+    order is the selection policy: when two reservations both fit, consuming the
+    one expiring first uses capacity that is about to be lost anyway, and leaves
+    the longer-lived one available for later work.
+
+    Args:
+        instance_type_name: Instance type *name* (e.g. 'a100-80gb.sxm.4x').
+            Reservations record the region-specific FID, so names are resolved
+            through the instance-type catalog.
+        region: Region name to match.
+        specific_reservations: If given, only these reservation names or FIDs
+            are considered.
+        config: Optional pre-resolved config dict.
+    """
+    reservations = list_reservations(config=config)
+    if not reservations:
+        return []
+
+    # Reservations reference an instance type by FID, and the same name maps to
+    # a different FID per region, so collect every FID sharing the name.
+    instance_types = get_instance_types()
+    matching_fids = {
+        fid for fid, record in instance_types.items()
+        if record.get('name') == instance_type_name
+    }
+    if not matching_fids:
+        logger.debug(f'No instance type FID matches name {instance_type_name}')
+        return []
+
+    usable: List[Dict[str, Any]] = []
+    for reservation in reservations:
+        name = reservation.get('name')
+        if name is None:
+            continue
+        if specific_reservations is not None and not (
+                name in specific_reservations or
+                reservation.get('fid') in specific_reservations):
+            continue
+        if reservation.get('status') not in _USABLE_RESERVATION_STATUSES:
+            continue
+        if reservation.get('region') != region:
+            continue
+        if reservation.get('instance_type') not in matching_fids:
+            continue
+        if _reservation_has_expired(reservation):
+            continue
+        if (reservation.get('instance_quantity') or 0) <= 0:
+            continue
+        usable.append(reservation)
+    return sorted(usable,
+                  key=lambda r:
+                  (_reservation_end_epoch(r) or math.inf, r['name']))
+
+
+def get_available_reservations(
+    instance_type_name: str,
+    region: str,
+    specific_reservations: Optional[Set[str]] = None,
+    config: Optional[Dict[str, str]] = None,
+) -> Dict[str, int]:
+    """Reserved instance capacity usable right now, keyed by reservation name.
+
+    Capacity is reported whole: the API exposes no per-instance "in use"
+    marker, so a reservation is either wholly available or not offered. See
+    design doc section 6.2.
+    """
+    available: Dict[str, int] = {}
+    for reservation in usable_reservations(instance_type_name, region,
+                                           specific_reservations, config):
+        name = reservation['name']
+        available[name] = (available.get(name, 0) +
+                           reservation['instance_quantity'])
+    return available
+
+
+def explain_unusable_reservations(
+    instance_type_name: str,
+    region: str,
+    num_nodes: int,
+    specific_reservations: Optional[Set[str]] = None,
+    config: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """Say why each reservation cannot host this cluster, one line each.
+
+    Asking for reserved capacity and silently getting a spot bid instead would
+    spend money the user did not ask to spend, so the failure has to be
+    explainable: this reports the first failing check per reservation, in the
+    order the checks are applied.
+    """
+    reservations = list_reservations(config=config)
+    if not reservations:
+        return ['No reservations exist in this project.']
+
+    type_name_by_fid = {
+        fid: record.get('name') for fid, record in get_instance_types().items()
+    }
+
+    reasons: List[str] = []
+    for reservation in sorted(reservations, key=lambda r: r.get('name') or ''):
+        name = reservation.get('name') or reservation.get('fid')
+        if specific_reservations is not None and not (
+                name in specific_reservations or
+                reservation.get('fid') in specific_reservations):
+            continue
+
+        status = reservation.get('status')
+        if status not in _USABLE_RESERVATION_STATUSES:
+            reasons.append(f'{name}: status is {status}.')
+        elif _reservation_has_expired(reservation):
+            reasons.append(f'{name}: window closed at '
+                           f'{reservation.get("end_time")}.')
+        elif reservation.get('region') != region:
+            reasons.append(f'{name}: is in {reservation.get("region")}, '
+                           f'not {region}.')
+        elif type_name_by_fid.get(
+                reservation.get('instance_type')) != instance_type_name:
+            held = type_name_by_fid.get(reservation.get('instance_type'),
+                                        reservation.get('instance_type'))
+            reasons.append(f'{name}: holds {held}, not {instance_type_name}.')
+        elif (reservation.get('instance_quantity') or 0) < num_nodes:
+            reasons.append(
+                f'{name}: holds {reservation.get("instance_quantity")} '
+                f'instance(s), fewer than the {num_nodes} this cluster needs '
+                '(a reservation is used whole and cannot grow).')
+        else:  # pragma: no cover - usable, so it would have been selected
+            reasons.append(f'{name}: usable.')
+
+    if not reasons:
+        named = ', '.join(sorted(specific_reservations or []))
+        return [f'No reservation named {named} exists in this project.']
+    return reasons
+
+
+def find_reservation_for_cluster(
+    instance_type_name: str,
+    region: str,
+    num_nodes: int,
+    specific_reservations: Optional[Set[str]] = None,
+    config: Optional[Dict[str, str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Pick a reservation that can host a cluster of `num_nodes`.
+
+    Returns the usable reservation whose window closes soonest and that holds at
+    least `num_nodes` instances, or None. A reservation is consumed whole by one
+    cluster, so one smaller than the cluster is not a partial match.
+    """
+    for reservation in usable_reservations(instance_type_name, region,
+                                           specific_reservations, config):
+        if reservation['instance_quantity'] >= num_nodes:
+            return reservation
+        logger.debug(
+            f'Reservation {reservation["name"]} holds '
+            f'{reservation["instance_quantity"]} instance(s), fewer than the '
+            f'{num_nodes} the cluster needs; skipping.')
+    return None
 
 
 DEFAULT_LIMIT_PRICE = 32.00

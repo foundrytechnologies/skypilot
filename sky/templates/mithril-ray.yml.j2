@@ -15,6 +15,9 @@ provider:
   region: "{{region}}"
   profile: "{{mithril_profile}}"
   project_id: "{{mithril_project_id}}"
+  # FID of the reservation backing this cluster, empty for bid-backed clusters.
+  reservation: "{{reservation}}"
+  reservation_name: "{{reservation_name}}"
   # Ray's autoscaler periodically checks if workers' launch config hash
   # matches the current YAML. On mismatch (e.g. after re-provision) it
   # terminates the "stale" worker and tries to replace it, leaking VMs.

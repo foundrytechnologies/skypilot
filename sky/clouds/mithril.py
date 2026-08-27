@@ -4,20 +4,25 @@ import math
 import os
 import re
 import typing
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from sky import catalog
 from sky import clouds
+from sky import exceptions
+from sky import sky_logging
 from sky import skypilot_config
 from sky.provision.mithril import utils as mithril_utils
 from sky.utils import accelerator_registry
 from sky.utils import registry
 from sky.utils import resources_utils
+from sky.utils import ux_utils
 from sky.utils.resources_utils import DiskTier
 
 if typing.TYPE_CHECKING:
     from sky import resources as resources_lib
     from sky.utils import volume as volume_lib
+
+logger = sky_logging.init_logger(__name__)
 
 
 @registry.CLOUD_REGISTRY.register
@@ -90,6 +95,38 @@ class Mithril(clouds.Cloud):
         if region is not None:
             regions = [r for r in regions if r.name == region]
         return regions
+
+    def get_reservations_available_resources(
+        self,
+        instance_type: str,
+        region: str,
+        zone: Optional[str],
+        specific_reservations: Set[str],
+    ) -> Dict[str, int]:
+        """Reserved capacity usable for this instance type and region.
+
+        Without this override the base implementation reports 0 for every
+        reservation, so the optimizer never sees reserved capacity. Callers
+        reach here only for non-spot resources:
+        Resources.get_reservations_available_resources() short-circuits when
+        use_spot is set, which matches Mithril, where a spot launch is a bid
+        rather than a claim on a reservation.
+
+        Failures degrade to "no reserved capacity" rather than propagating: a
+        reservation lookup problem should fall back to bidding, not break
+        provisioning.
+        """
+        del zone  # Mithril does not support zones.
+        try:
+            return mithril_utils.get_available_reservations(
+                instance_type_name=instance_type,
+                region=region,
+                specific_reservations=specific_reservations or None,
+            )
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug(f'Failed to query Mithril reservations for '
+                         f'{instance_type} in {region}: {e}')
+            return {}
 
     @classmethod
     def get_vcpus_mem_from_instance_type(
@@ -273,6 +310,93 @@ class Mithril(clouds.Cloud):
     ) -> float:
         return 0.0
 
+    @staticmethod
+    def _reservation_config(
+        resources: 'resources_lib.Resources',
+        region: str,
+    ) -> Tuple[Set[str], bool]:
+        """The user's reservation config for this cloud/region."""
+        specific = set(
+            skypilot_config.get_effective_region_config(
+                cloud='mithril',
+                region=region,
+                keys=('specific_reservations',),
+                default_value=[],
+                override_configs=resources.cluster_config_overrides,
+            ))
+        prioritize = bool(
+            skypilot_config.get_effective_region_config(
+                cloud='mithril',
+                region=region,
+                keys=('prioritize_reservations',),
+                default_value=False,
+                override_configs=resources.cluster_config_overrides,
+            ))
+        return specific, prioritize
+
+    def _select_reservation(
+        self,
+        resources: 'resources_lib.Resources',
+        region: str,
+        num_nodes: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Pick the reservation this cluster should run on, if any.
+
+        A spot launch is a bid, so it never claims a reservation (§3.1). Asking
+        for reserved capacity that turns out to be unusable is an error, not a
+        cue to bid: falling through would spend money on spot capacity while the
+        user is already paying for a reservation. The error names every candidate
+        and why it was rejected.
+
+        `prioritize_reservations` on its own is a preference rather than a
+        request, so it degrades to a bid — but says so, and says why.
+        """
+        if resources.use_spot:
+            return None
+        specific, prioritize = self._reservation_config(resources, region)
+        if not specific and not prioritize:
+            return None
+
+        assert resources.instance_type is not None, resources
+        reservation = mithril_utils.find_reservation_for_cluster(
+            instance_type_name=resources.instance_type,
+            region=region,
+            num_nodes=num_nodes,
+            specific_reservations=specific or None,
+        )
+        if reservation is not None:
+            logger.info(f'Using Mithril reservation {reservation["name"]} '
+                        f'({reservation["instance_quantity"]} instance(s) '
+                        f'reserved) for this cluster.')
+            return reservation
+
+        reasons = mithril_utils.explain_unusable_reservations(
+            instance_type_name=resources.instance_type,
+            region=region,
+            num_nodes=num_nodes,
+            specific_reservations=specific or None,
+        )
+        detail = (f'No reservation can host {num_nodes} x '
+                  f'{resources.instance_type} in {region}:\n  ' +
+                  '\n  '.join(reasons))
+        if specific:
+            # SkyPilot's provisioning loop treats a per-candidate
+            # ResourcesUnavailableError as "try the next candidate" and reports
+            # its own generic failure, so the reasons have to be logged to reach
+            # the user at all.
+            logger.error(detail)
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.ResourcesUnavailableError(
+                    f'{detail}\n'
+                    'Reserved capacity was requested, so this did not fall back '
+                    'to a spot bid. Create or extend a suitable reservation '
+                    '(`ml reservation create`), or drop the reservation request '
+                    'to launch on spot capacity.')
+        logger.warning(f'{detail}\nmithril.prioritize_reservations is set but '
+                       'no reservation applies, so this will bid for spot '
+                       'capacity instead.')
+        return None
+
     def make_deploy_resources_variables(
         self,
         resources: 'resources_lib.Resources',
@@ -322,6 +446,8 @@ class Mithril(clouds.Cloud):
             default_value=False,
             override_configs=resources.cluster_config_overrides,
         )
+        reservation = self._select_reservation(resources, region.name,
+                                               num_nodes)
 
         resources_vars: Dict[str, Any] = {
             'instance_type': resources.instance_type,
@@ -332,6 +458,11 @@ class Mithril(clouds.Cloud):
             'mithril_project_id': config['project_id'],
             'limit_price': limit_price,
             'restart_job_after_interruption': restart_job_after_interruption,
+            # Empty for bid-backed clusters. Persisted in the cluster YAML so
+            # every later provider call knows which reservation this cluster
+            # lives on; instance names cannot carry that link (see design 3.2).
+            'reservation': reservation['fid'] if reservation else '',
+            'reservation_name': reservation['name'] if reservation else '',
         }
 
         docker_run_options = []

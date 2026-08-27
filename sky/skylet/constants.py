@@ -492,6 +492,11 @@ OVERRIDEABLE_CONFIG_KEYS_IN_TASK: List[Tuple[str, ...]] = [
     ('vast', 'create_instance_kwargs'),
     ('mithril', 'limit_price'),
     ('mithril', 'restart_job_after_interruption'),
+    # Per-launch reservation selection, so `ml launch --reservation X` survives
+    # Resources.copy() during optimization. Without these the request is
+    # filtered out here and the launch silently falls back to a spot bid.
+    ('mithril', 'specific_reservations'),
+    ('mithril', 'prioritize_reservations'),
     ('active_workspace',),
 ]
 # When overriding the SkyPilot configs on the API server with the client one,
